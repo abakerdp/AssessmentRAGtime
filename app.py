@@ -1,151 +1,154 @@
 import streamlit as st
-from typing import List, Dict
-import numpy as np
-from sentence_transformers import SentenceTransformer
-import faiss
-import textwrap
+import chromadb
+import os
+import tempfile
+
+# Force chromadb to use HTTP client
+os.environ["CHROMADB_CLIENT"] = "rest"
 
 class SimpleRAG:
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """Initialize the RAG system with a specified embedding model."""
-        self.model = SentenceTransformer(model_name)
-        self.index = None
-        self.chunks = []
+    def __init__(self):
+        """Initialize the RAG system using ChromaDB with default embeddings"""
+        # Create a temporary directory for ChromaDB
+        self.temp_dir = tempfile.mkdtemp()
+        # Initialize client with persistent directory
+        self.client = chromadb.PersistentClient(path=self.temp_dir)
         
-    def load_documents(self, documents: List[str]) -> None:
-        """Load and chunk documents."""
-        self.chunks = []
-        for doc in documents:
-            # Simple paragraph-based chunking
-            paragraphs = doc.split('\n\n')
-            for para in paragraphs:
-                # Clean and wrap text
-                cleaned = ' '.join(para.split())
-                if cleaned:
-                    # Split into smaller chunks if paragraph is too long
-                    if len(cleaned) > 500:
-                        wrapped = textwrap.wrap(cleaned, 500)
-                        self.chunks.extend(wrapped)
-                    else:
-                        self.chunks.append(cleaned)
+        # Create or get collection
+        try:
+            self.collection = self.client.create_collection("documents")
+        except ValueError:
+            self.collection = self.client.get_collection("documents")
+        
+    def add_documents(self, documents: list[str]) -> None:
+        """Add documents to the collection"""
+        # Reset collection
+        try:
+            self.client.delete_collection("documents")
+            self.collection = self.client.create_collection("documents")
+        except ValueError:
+            pass
+        
+        # Add documents with simple IDs
+        if documents:
+            self.collection.add(
+                documents=documents,
+                ids=[f"doc_{i}" for i in range(len(documents))]
+            )
     
-    def build_index(self) -> None:
-        """Create FAISS index from document chunks."""
-        if not self.chunks:
-            return
-            
-        # Generate embeddings
-        embeddings = self.model.encode(self.chunks)
-        
-        # Initialize FAISS index
-        dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatL2(dimension)
-        
-        # Add embeddings to index
-        self.index.add(np.array(embeddings).astype('float32'))
-    
-    def retrieve(self, query: str, k: int = 3) -> List[Dict[str, any]]:
-        """Retrieve relevant chunks for a query."""
-        if not self.index:
-            return []
-            
-        # Generate query embedding
-        query_embedding = self.model.encode([query])
-        
-        # Search index
-        distances, indices = self.index.search(
-            np.array(query_embedding).astype('float32'), k
-        )
-        
-        # Format results
-        results = []
-        for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-            results.append({
-                'chunk': self.chunks[idx],
-                'score': float(dist),
-                'rank': i + 1
-            })
-            
-        return results
+    def query(self, question: str, n_results: int = 3) -> list[str]:
+        """Query the documents"""
+        try:
+            results = self.collection.query(
+                query_texts=[question],
+                n_results=min(n_results, self.collection.count())
+            )
+            return results['documents'][0]
+        except Exception as e:
+            if "Found no documents" in str(e):
+                return []
+            raise e
 
-# Initialize the RAG system
-@st.cache_resource
-def get_rag_system():
-    return SimpleRAG()
-
-# Streamlit interface
-st.title("📚 Simple RAG System")
-
-# Sidebar for document input
-st.sidebar.header("Add Documents")
-doc_input = st.sidebar.text_area(
-    "Enter your documents here (one or more paragraphs):",
-    height=300,
-    help="Paste your text documents here. Separate different documents with blank lines."
+# Set page config
+st.set_page_config(
+    page_title="Simple RAG System",
+    page_icon="📚",
+    layout="wide"
 )
 
-# Initialize or get RAG system
-rag = get_rag_system()
+# Initialize RAG system
+@st.cache_resource
+def get_rag():
+    return SimpleRAG()
 
-# Process documents when submitted
-if st.sidebar.button("Process Documents"):
-    if doc_input.strip():
-        with st.spinner("Processing documents..."):
-            rag.load_documents([doc_input])
-            rag.build_index()
-        st.sidebar.success("Documents processed successfully!")
-    else:
-        st.sidebar.error("Please enter some documents first.")
+rag = get_rag()
 
-# Main area for queries
-st.header("Ask Questions")
-query = st.text_input("Enter your question:", key="query")
-k = st.slider("Number of results to return:", min_value=1, max_value=5, value=3)
+# Add custom CSS
+st.markdown("""
+    <style>
+    .stButton>button {
+        width: 100%;
+    }
+    .stTextArea>div>div>textarea {
+        background-color: #f0f2f6;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-# Process query
-if st.button("Search"):
-    if not rag.index:
-        st.error("Please add and process some documents first!")
-    elif not query.strip():
-        st.error("Please enter a question!")
-    else:
-        with st.spinner("Searching..."):
-            results = rag.retrieve(query, k=k)
-            
-        if results:
-            st.subheader("Results:")
-            for result in results:
-                with st.expander(f"Result {result['rank']} (Score: {result['score']:.4f})"):
-                    st.write(result['chunk'])
+# Create two columns
+col1, col2 = st.columns([1, 2])
+
+# Sidebar (Document Input)
+with col1:
+    st.header("📝 Add Documents")
+    doc_input = st.text_area(
+        "Enter your documents here:",
+        height=300,
+        placeholder="Paste your text here... Separate different documents with blank lines."
+    )
+    
+    if st.button("🔄 Process Documents"):
+        if doc_input.strip():
+            with st.spinner("Processing documents..."):
+                # Split into paragraphs and filter empty ones
+                docs = [d.strip() for d in doc_input.split('\n\n') if d.strip()]
+                rag.add_documents(docs)
+                st.success("✅ Documents processed successfully!")
         else:
-            st.warning("No results found. Try a different query or add more documents.")
+            st.error("⚠️ Please enter some documents first")
 
-# Add sample data button
-if st.sidebar.button("Load Sample Data"):
-    sample_data = """ChatGPT is an artificial intelligence chatbot developed by OpenAI. 
-    It was launched in November 2022 and has gained significant popularity.
-    The chatbot uses natural language processing to generate human-like responses.
-    
-    ChatGPT is built on top of OpenAI's GPT family of large language models.
-    It can engage in conversations, answer questions, and assist with various tasks.
-    
-    OpenAI was founded in 2015 with the goal of ensuring artificial 
-    intelligence benefits humanity as a whole. The company has developed
-    several influential AI models and technologies.
-    
-    In 2019, OpenAI transitioned from a non-profit to a "capped-profit"
-    model to attract more funding while maintaining its mission."""
-    
-    with st.spinner("Loading sample data..."):
-        rag.load_documents([sample_data])
-        rag.build_index()
-    st.sidebar.success("Sample data loaded!")
+    # Sample data button
+    if st.button("📚 Load Sample Data"):
+        sample_docs = [
+            "Python is a high-level programming language known for its simplicity and readability. It was created by Guido van Rossum and released in 1991.",
+            "Python supports multiple programming paradigms, including procedural, object-oriented, and functional programming. It has a large standard library.",
+            "Python is widely used in data science, machine learning, web development, and automation. Many popular frameworks like Django and Flask are written in Python.",
+            "Python's package manager pip makes it easy to install and manage third-party packages. The Python Package Index (PyPI) hosts millions of projects."
+        ]
+        with st.spinner("Loading sample data..."):
+            rag.add_documents(sample_docs)
+            st.success("✅ Sample data loaded!")
 
-# Add instructions
-with st.sidebar.expander("How to use"):
-    st.markdown("""
-    1. **Add documents**: Paste your text in the sidebar text area and click "Process Documents"
-    2. **Or use sample data**: Click "Load Sample Data" to try with example content
-    3. **Ask questions**: Type your question in the main area and click "Search"
-    4. **Adjust results**: Use the slider to control how many results you see
-    """)
+    # Instructions
+    with st.expander("ℹ️ How to use"):
+        st.markdown("""
+        1. **Add documents:**
+           - Paste text in the box above, or
+           - Click "Load Sample Data"
+        2. **Process:**
+           - Click "Process Documents"
+        3. **Query:**
+           - Type your question
+           - Adjust number of results
+           - Click "Search"
+        """)
+
+# Main area (Query Interface)
+with col2:
+    st.header("🔍 Ask Questions")
+    query = st.text_input("Enter your question:", placeholder="What would you like to know?")
+    n_results = st.slider("Number of results:", 1, 5, 3)
+
+    if st.button("🔎 Search"):
+        if not query.strip():
+            st.error("⚠️ Please enter a question")
+        else:
+            with st.spinner("Searching..."):
+                results = rag.query(query, n_results)
+                
+            if results:
+                st.subheader("📊 Results:")
+                for i, result in enumerate(results, 1):
+                    with st.expander(f"Result {i}"):
+                        st.markdown(f"```\n{result}\n```")
+            else:
+                st.warning("ℹ️ No results found. Try adding some documents first or rephrase your question.")
+
+    # Show some example questions
+    with st.expander("💡 Example questions (with sample data)"):
+        st.markdown("""
+        - When was Python created?
+        - What is Python used for?
+        - How does Python package management work?
+        - What programming paradigms does Python support?
+        """)
